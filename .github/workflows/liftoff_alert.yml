@@ -1,0 +1,33 @@
+name: Liftoff Campaign Alert
+
+on:
+  schedule:
+    - cron: '0 0 * * *'   # 매일 UTC 00:00 = 한국 시간 09:00
+  workflow_dispatch:        # 수동 실행 버튼도 생김
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Python 설치
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 패키지 설치
+        run: pip install requests
+
+      - name: 캠페인 알럿 실행
+        env:
+          ACCOUNT_1_NAME:    ${{ secrets.ACCOUNT_1_NAME }}
+          ACCOUNT_1_KEY:     ${{ secrets.ACCOUNT_1_KEY }}
+          ACCOUNT_1_SECRET:  ${{ secrets.ACCOUNT_1_SECRET }}
+          # 어카운트 추가시 아래 주석 해제
+          # ACCOUNT_2_NAME:  ${{ secrets.ACCOUNT_2_NAME }}
+          # ACCOUNT_2_KEY:   ${{ secrets.ACCOUNT_2_KEY }}
+          # ACCOUNT_2_SECRET: ${{ secrets.ACCOUNT_2_SECRET }}
+          SLACK_CHANNEL_ID:  ${{ secrets.SLACK_CHANNEL_ID }}
+          SLACK_BOT_TOKEN:   ${{ secrets.SLACK_BOT_TOKEN }}
+        run: python liftoff_alert.py
