@@ -2,8 +2,8 @@ name: Liftoff Campaign Alert
 
 on:
   schedule:
-    - cron: '0 1 * * *'   # UTC 01:00 = KST 10:00
-    - cron: '0 6 * * *'   # UTC 06:00 = KST 15:00
+  - cron: '5 1 * * *'   # UTC 01:05 = KST 10:05
+  - cron: '5 6 * * *'   # UTC 06:05 = KST 15:05
   workflow_dispatch:        # Manual run button
 
 jobs:
