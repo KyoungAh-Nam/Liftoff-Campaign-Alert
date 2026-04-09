@@ -1,34 +1,161 @@
-name: Liftoff Campaign Alert
+import os
+import time
+import requests
+from datetime import datetime, timedelta, timezone
 
-on:
-  schedule:
-    - cron: '0 1 * * *'   # UTC 01:00 = KST 10:00
-    - cron: '0 6 * * *'   # UTC 06:00 = KST 15:00
-  workflow_dispatch:        # Manual run button
+# ── Config (loaded from GitHub Secrets) ───────────────────────
+ACCOUNTS = [
+    {"name": os.environ["ACCOUNT_1_NAME"], "api_key": os.environ["ACCOUNT_1_KEY"], "api_secret": os.environ["ACCOUNT_1_SECRET"]},
+    # {"name": os.environ["ACCOUNT_2_NAME"], "api_key": os.environ["ACCOUNT_2_KEY"], "api_secret": os.environ["ACCOUNT_2_SECRET"]},
+]
+SLACK_CHANNEL_ID = os.environ["SLACK_CHANNEL_ID"]
+SLACK_BOT_TOKEN  = os.environ["SLACK_BOT_TOKEN"]
 
-jobs:
-  alert:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+BASE_URL = "https://data.liftoff.io/api/v1"
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
+# ── Alert thresholds ───────────────────────────────────────────
+THRESHOLDS = {
+    "ctr_change_pct":    20,   # CTR ±20% change
+    "cpi_increase_pct":  20,   # CPI +20% spike
+    "install_drop_pct": -20,   # Installs -20% drop
+}
 
-      - name: Install dependencies
-        run: pip install requests
+# ── Time range: today vs yesterday same timeframe ─────────────
+def get_time_ranges():
+    now = datetime.now(timezone.utc)
+    today_start     = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = today_start - timedelta(days=1)
+    yesterday_same  = yesterday_start + (now - today_start)
+    fmt = lambda d: d.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return fmt(today_start), fmt(now), fmt(yesterday_start), fmt(yesterday_same)
 
-      - name: Run campaign alert
-        env:
-          ACCOUNT_1_NAME:    ${{ secrets.ACCOUNT_1_NAME }}
-          ACCOUNT_1_KEY:     ${{ secrets.ACCOUNT_1_KEY }}
-          ACCOUNT_1_SECRET:  ${{ secrets.ACCOUNT_1_SECRET }}
-          # Add more accounts below if needed
-          # ACCOUNT_2_NAME:  ${{ secrets.ACCOUNT_2_NAME }}
-          # ACCOUNT_2_KEY:   ${{ secrets.ACCOUNT_2_KEY }}
-          # ACCOUNT_2_SECRET: ${{ secrets.ACCOUNT_2_SECRET }}
-          SLACK_CHANNEL_ID:  ${{ secrets.SLACK_CHANNEL_ID }}
-          SLACK_BOT_TOKEN:   ${{ secrets.SLACK_BOT_TOKEN }}
-        run: python liftoff_alert.py
+# ── Liftoff API calls ──────────────────────────────────────────
+def create_report(api_key, api_secret, start, end):
+    res = requests.post(
+        f"{BASE_URL}/reports",
+        json={"start_time": start, "end_time": end, "group_by": ["apps", "campaigns"], "format": "json"},
+        auth=(api_key, api_secret),
+    )
+    res.raise_for_status()
+    return res.json()["id"]
+
+def poll_report(api_key, api_secret, report_id, timeout=300):
+    for _ in range(timeout // 10):
+        time.sleep(10)
+        res = requests.get(f"{BASE_URL}/reports/{report_id}/status", auth=(api_key, api_secret))
+        state = res.json()["state"]
+        if state == "completed":
+            return True
+        if state in ("failed", "cancelled"):
+            return False
+    return False
+
+def get_report_data(api_key, api_secret, report_id):
+    res = requests.get(f"{BASE_URL}/reports/{report_id}/data", auth=(api_key, api_secret))
+    res.raise_for_status()
+    data = res.json()
+    if not data.get("rows"):
+        return []
+    cols = data["columns"]
+    return [dict(zip(cols, row)) for row in data["rows"]]
+
+def get_campaigns(api_key, api_secret):
+    res = requests.get(f"{BASE_URL}/campaigns", auth=(api_key, api_secret))
+    return {c["id"]: c["name"] for c in res.json()} if res.ok else {}
+
+# ── Alert detection ────────────────────────────────────────────
+def detect_alerts(today_rows, yest_rows, camp_names, account_name):
+    alerts = []
+    yest_map = {r["campaign_id"]: r for r in yest_rows}
+
+    for t in today_rows:
+        y = yest_map.get(t["campaign_id"])
+        if not y:
+            continue
+        name = camp_names.get(t["campaign_id"], t["campaign_id"])
+        chg  = lambda a, b: ((a - b) / b * 100) if b else 0
+
+        ctr_chg     = chg(t.get("ctr", 0),      y.get("ctr", 0))
+        cpi_chg     = chg(t.get("cpi", 0),      y.get("cpi", 0))
+        install_chg = chg(t.get("installs", 0), y.get("installs", 0))
+
+        if abs(ctr_chg) >= THRESHOLDS["ctr_change_pct"]:
+            alerts.append({
+                "account": account_name, "campaign": name, "type": "CTR Anomaly",
+                "severity": "critical" if abs(ctr_chg) >= 40 else "warning",
+                "detail": f"CTR {'▲' if ctr_chg>0 else '▼'} {abs(ctr_chg):.1f}% ({y['ctr']:.3f} → {t['ctr']:.3f})"
+            })
+        if cpi_chg >= THRESHOLDS["cpi_increase_pct"]:
+            alerts.append({
+                "account": account_name, "campaign": name, "type": "CPI Spike",
+                "severity": "critical" if cpi_chg >= 40 else "warning",
+                "detail": f"CPI ▲ {cpi_chg:.1f}% (${y['cpi']:.2f} → ${t['cpi']:.2f})"
+            })
+        if install_chg <= THRESHOLDS["install_drop_pct"]:
+            alerts.append({
+                "account": account_name, "campaign": name, "type": "Install Drop",
+                "severity": "critical" if install_chg <= -35 else "warning",
+                "detail": f"Installs ▼ {abs(install_chg):.1f}% ({int(y['installs'])} → {int(t['installs'])})"
+            })
+    return alerts
+
+# ── Slack message ──────────────────────────────────────────────
+def send_slack(alerts, account_count):
+    if not alerts:
+        msg = (
+            f"✅ *Liftoff Campaign Alert* | {datetime.now().strftime('%Y-%m-%d %H:%M')} KST\n\n"
+            f"All campaigns are performing normally 🎉\n"
+            f"> {account_count} account(s) checked"
+        )
+    else:
+        critical = [a for a in alerts if a["severity"] == "critical"]
+        warning  = [a for a in alerts if a["severity"] == "warning"]
+        lines = []
+        for a in alerts:
+            icon  = "🔴" if a["severity"] == "critical" else "🟡"
+            label = "CRITICAL" if a["severity"] == "critical" else "WARNING"
+            lines.append(f"{icon} *[{label}] {a['type']}* `{a['account']}` - {a['campaign']}\n   └ {a['detail']}")
+        msg = (
+            f"🚨 *Liftoff Campaign Alert* | {datetime.now().strftime('%Y-%m-%d %H:%M')} KST\n\n"
+            + "\n".join(lines)
+            + f"\n\n> 🔴 Critical: {len(critical)}  🟡 Warning: {len(warning)} | {account_count} account(s) checked"
+        )
+
+    res = requests.post(
+        "https://slack.com/api/chat.postMessage",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        json={"channel": SLACK_CHANNEL_ID, "text": msg, "mrkdwn": True},
+    )
+    print("Slack:", res.json().get("ok"), res.json().get("error", ""))
+
+# ── Main ───────────────────────────────────────────────────────
+def main():
+    today_start, now_str, yest_start, yest_same = get_time_ranges()
+    print(f"Checking: today {today_start}~{now_str} vs yesterday {yest_start}~{yest_same}")
+
+    all_alerts = []
+
+    for acc in ACCOUNTS:
+        print(f"\nChecking {acc['name']}...")
+        try:
+            camp_names = get_campaigns(acc["api_key"], acc["api_secret"])
+            tid = create_report(acc["api_key"], acc["api_secret"], today_start, now_str)
+            yid = create_report(acc["api_key"], acc["api_secret"], yest_start, yest_same)
+
+            if poll_report(acc["api_key"], acc["api_secret"], tid) and \
+               poll_report(acc["api_key"], acc["api_secret"], yid):
+                today_rows = get_report_data(acc["api_key"], acc["api_secret"], tid)
+                yest_rows  = get_report_data(acc["api_key"], acc["api_secret"], yid)
+                alerts = detect_alerts(today_rows, yest_rows, camp_names, acc["name"])
+                all_alerts.extend(alerts)
+                print(f"  → {len(alerts)} alert(s) detected")
+            else:
+                print(f"  → Report generation failed")
+        except Exception as e:
+            print(f"  → Error: {e}")
+
+    send_slack(all_alerts, len(ACCOUNTS))
+    print("\nDone!")
+
+if __name__ == "__main__":
+    main()
